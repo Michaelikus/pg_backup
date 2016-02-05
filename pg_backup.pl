@@ -1,5 +1,8 @@
 #!/usr/bin/perl 
 
+# Written by Mikhail V Butalin
+# m.butalin@gmail.com
+
 # Скрипт должен стартовать не раньше 00:00, т.к. собирает WAL'ы предыдущего дня
 # Проверьте наличие необходимых модулей перед запуском:
 # File::Path
@@ -15,7 +18,7 @@ my $DEBUG_MODE = 0;
 
 # Настроечные переменные
 
-my $WAL_DIR		= "/media/xvdb_backup/pgsql_backup/wal";			# полный путь до директории, куда складываются wal(НЕ pg_xglog!!!)
+my $WAL_DIR		= "/media/xvdb_backup/pgsql_backup/wal";			# полный путь до директории, куда перемещаются wal из pg_xglog
 my $WAL_ARCH_NAME	= "WAL-";							# префикс для архива wal
 my $PGC_ARCH_NAME	= "PGC-";							# префикс для архива wal
 
@@ -31,7 +34,7 @@ my $WAL_ARCH_CMD_LOG	= "";
 
 # Команда pg_basebackup без путей к архиву(понадобится тем кто не согласен с опциями)
 # замените pg01_replicator - пользователь, имеющий права репликации и, желательно, имеющего возможность на аутентификацию trust, если будете добавлять скрипт в cron.
-my $PGC_ARCH_CMD	= "pg_basebackup -h localhost -U pg01_replicator -v -P -R -X stream -c fast";
+my $PGC_ARCH_CMD	= "pg_basebackup -h localhost -U pg01_replicator -v -P -R -x -c fast";
 my $PGC_ARCH_CMD_LOG	= "";
 
 
@@ -39,6 +42,7 @@ my $PGC_ARCH_CMD_LOG	= "";
 # Перечень тейблспейсов для опций -Т. Может быть сколько угодно.
 # 1 - путь до актуального тейблспейса
 # 2 - название директории тейблспейса(НЕ ПУТЬ К НЕЙ!!!) в архиве. Обычно соответствует названию самого тейблспейса.
+
 # если у вас не используются тейблспейсы, задайте переменную так: my @PG_TABLESPACE = ();
 my @PG_TABLESPACE	= (
     ["/var/lib/postgresql/9.4/ts01", "ts01"],
@@ -64,16 +68,22 @@ my $filedate = "";
 
 my ($fsec, $fmin, $fhour, $fday, $fmonth, $fyear) = ('','','','','','');
 
-
 my ($DAY, $MONTH, $YEAR) = (localtime)[3,4,5];
+
+my @wals;	# массив для хранения списка wal-файлов
+my $line;
+
+my $WAL_RM_CMD		= "rm -f ";
+my $WAL_RM_CMD_LOG	= "";
 
 # приводим значения месяца и года к понятным
 $MONTH++;
 $YEAR+=1900;
 
-#$DAY	= 6;
-#$MONTH	= 12;
-#$YEAR	= 2015;
+# Следующие три переменные для отладки на обозначенную дату
+#$DAY	= 22;
+#$MONTH	= 1;
+#$YEAR	= 2016;
 
 # проверка на первый день месяца и первый месяц в году
 if($DAY == 1){
@@ -138,13 +148,18 @@ if( $DEBUG_MODE == 1){
 
 opendir(my $dh, $WAL_DIR) || die "WTF?!? $! $_";
 
+# Формируем список файлов для добавления в WAL-архив и массив для последующего удаления файлов, добавленных в архив(ну не умеет 7zip перемещать файлы в архив!)
+open(WALS, '>', "$WAL_ARCH_FULL_PATH/$WAL_ARCH_NAME.lst");
+
+my @wals;
+
 while(readdir $dh) {
     $filename = "$WAL_DIR/$_";
 
     # Считываем время создания файла и приводим его в человеческий вид
     ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks) = stat($filename);
 
-    
+
 
     ($fsec, $fmin, $fhour, $fday, $fmonth, $fyear) = (localtime($mtime))[0,1,2,3,4,5];
     $fyear += 1900;
@@ -155,40 +170,52 @@ while(readdir $dh) {
     if(length($fhour)  == 1) { $fhour  = "0$fhour"  }
     if(length($fmin)   == 1) { $fmin   = "0$fmin"   }
     if(length($fsec)   == 1) { $fsec   = "0$fsec"   }
- 
+
     $filedate = "$fday/$fmonth/$fyear";
 
 #    print S_ISDIR($mode) . "\t".$filename."\n";
 
     # Сверяем дату создания файла с предыдущеим днем и если она совпадает, переносим файл в архим
-    if( ($filedate eq "$Prev_day/$Prev_month/$Prev_year") and !S_ISDIR($mode) ){ #
+    if( ($filedate eq "$Prev_day/$Prev_month/$Prev_year") and !S_ISDIR($mode) ){
 	if( $DEBUG_MODE == 1 ) {
 	    print "7z: $fday/$fmonth/$fyear $fhour:$fmin:$fsec\t";
 	    print "$filename\n";
 	}
 
-	# Добавляем файлы в архив, затем удаляем.
-	$WAL_ARCH_CMD = "7z a " . "$WAL_ARCH_FULL_PATH/$WAL_ARCH_NAME" . "$Prev_year-$Prev_month-$Prev_day.7z" ." ". $filename;
-	$WAL_ARCH_CMD_LOG = `$WAL_ARCH_CMD`;
-	#print $WAL_ARCH_CMD . "\n";
-	
-
-	# А удаляем, потому что 7z не умеет самостоятельно переносить файлы в архив
-	$WAL_ARCH_CMD = "rm $filename";
-	$WAL_ARCH_CMD_LOG = `$WAL_ARCH_CMD`;
+	# Формируем перечень файлов для создания списка архивации и последующего удаления
+	print WALS "$filename\n";
+	push(@wals, $filename);
 
 	if( $DEBUG_MODE == 1 ) {
 	    print $WAL_ARCH_CMD."\n";
 	}
-
     }
 }
-
+close WALS;
 closedir $dh;
+
+# Пакуем wal-файлы из списка
+$WAL_ARCH_CMD = "7z a -i\@"."$WAL_ARCH_FULL_PATH/$WAL_ARCH_NAME.lst " . "$WAL_ARCH_FULL_PATH/$WAL_ARCH_NAME" . "$Prev_year-$Prev_month-$Prev_day.zip";
+if( $DEBUG_MODE == 1){
+print "$WAL_ARCH_CMD\n";
+}
+
+$WAL_ARCH_CMD_LOG = `$WAL_ARCH_CMD`;
+if( $DEBUG_MODE == 1){
+print "$WAL_ARCH_CMD_LOG\n";
+}
+
+# Удаляем которые уже запаковали
+foreach $line(@wals){
+    $WAL_RM_CMD_LOG = `$WAL_RM_CMD $line`;
+    if( $DEBUG_MODE == 1){
+	print "$WAL_RM_CMD $line\n";
+    }
+}
 
 # А теперь сжимаем кластер, чтоб сэкономить пространство
 $PGC_ARCH_CMD     = "7z a " . $PGC_ARCH_PATH.$YEAR."/".$YEAR."-".$MONTH."/".$PGC_ARCH_NAME."$YEAR-$MONTH-$DAY.7z"." ".$PGC_ARCH_FULL_PATH."/.";
 $PGC_ARCH_CMD_LOG = `$PGC_ARCH_CMD`;
 
-# Удаляем
+# Удаляем то что сжали
 $PGC_ARCH_CMD_LOG = `rm -rf $PGC_ARCH_FULL_PATH/*`;
